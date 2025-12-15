@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -45,17 +44,18 @@ func ensureLogFile(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 }
 
-func newLogger(path string) (*log.Logger, *os.File, error) {
+func newLogger(path string) (*log.Logger, *os.File, *log.Logger, error) {
 	f, err := ensureLogFile(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	w := io.MultiWriter(os.Stdout, f)
-	logger := log.New(w, "", log.LstdFlags|log.LUTC)
-	return logger, f, nil
+	// Write to stdout with timestamp for docker logs, file without timestamp for Fluent Bit parsing
+	stdoutLogger := log.New(os.Stdout, "", log.LstdFlags|log.LUTC)
+	fileLogger := log.New(f, "", 0) // No timestamp prefix for clean JSON
+	return stdoutLogger, f, fileLogger, nil
 }
 
-func traceMiddleware(logger *log.Logger, next http.Handler) http.Handler {
+func traceMiddleware(stdoutLogger *log.Logger, fileLogger *log.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		traceID := r.Header.Get("X-Trace-Id")
@@ -69,7 +69,7 @@ func traceMiddleware(logger *log.Logger, next http.Handler) http.Handler {
 		next.ServeHTTP(rec, r.WithContext(ctx))
 
 		latency := time.Since(start)
-		logJSON(logger, logEntry{
+		logJSON(stdoutLogger, fileLogger, logEntry{
 			TraceID:   traceID,
 			Method:    r.Method,
 			Path:      r.URL.Path,
@@ -80,16 +80,19 @@ func traceMiddleware(logger *log.Logger, next http.Handler) http.Handler {
 	})
 }
 
-func logJSON(logger *log.Logger, entry logEntry) {
+func logJSON(stdoutLogger *log.Logger, fileLogger *log.Logger, entry logEntry) {
 	b, err := json.Marshal(entry)
 	if err != nil {
-		logger.Printf(`{"message":"failed to marshal log","error":"%v"}`, err)
+		stdoutLogger.Printf(`{"message":"failed to marshal log","error":"%v"}`, err)
+		fileLogger.Printf(`{"message":"failed to marshal log","error":"%v"}\n`, err)
 		return
 	}
-	logger.Println(string(b))
+	// Write to stdout with timestamp, file without timestamp (pure JSON)
+	stdoutLogger.Println(string(b))
+	fileLogger.Printf("%s\n", string(b))
 }
 
-func handleHello(logger *log.Logger) http.HandlerFunc {
+func handleHello(stdoutLogger *log.Logger, fileLogger *log.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		traceID, _ := r.Context().Value(traceKey).(string)
 		resp := map[string]string{
@@ -101,7 +104,7 @@ func handleHello(logger *log.Logger) http.HandlerFunc {
 
 		if err := json.NewEncoder(w).Encode(resp); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
-			logJSON(logger, logEntry{
+			logJSON(stdoutLogger, fileLogger, logEntry{
 				TraceID: traceID,
 				Method:  r.Method,
 				Path:    r.URL.Path,
@@ -111,7 +114,7 @@ func handleHello(logger *log.Logger) http.HandlerFunc {
 			return
 		}
 
-		logJSON(logger, logEntry{
+		logJSON(stdoutLogger, fileLogger, logEntry{
 			TraceID: traceID,
 			Method:  r.Method,
 			Path:    r.URL.Path,
@@ -122,16 +125,16 @@ func handleHello(logger *log.Logger) http.HandlerFunc {
 }
 
 func main() {
-	logger, file, err := newLogger(logPath)
+	stdoutLogger, file, fileLogger, err := newLogger(logPath)
 	if err != nil {
 		log.Fatalf("cannot init logger: %v", err)
 	}
 	defer file.Close()
 
 	mux := http.NewServeMux()
-	mux.Handle("/hello", handleHello(logger))
+	mux.Handle("/hello", handleHello(stdoutLogger, fileLogger))
 
-	handler := traceMiddleware(logger, mux)
+	handler := traceMiddleware(stdoutLogger, fileLogger, mux)
 
 	server := &http.Server{
 		Addr:         ":8080",
@@ -141,8 +144,9 @@ func main() {
 		IdleTimeout:  30 * time.Second,
 	}
 
-	logger.Println(`{"message":"server starting","addr":":8080"}`)
+	stdoutLogger.Println(`{"message":"server starting","addr":":8080"}`)
+	fileLogger.Printf(`{"message":"server starting","addr":":8080"}\n`)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		logger.Fatalf(`{"message":"server error","error":"%v"}`, err)
+		stdoutLogger.Fatalf(`{"message":"server error","error":"%v"}`, err)
 	}
 }

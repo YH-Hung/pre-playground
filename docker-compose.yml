@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.15.1
@@ -32,6 +30,7 @@ services:
     image: fluent/fluent-bit:3.1
     volumes:
       - ./fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - ./fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf:ro
       - server-logs:/var/log/app:ro
     depends_on:
       server:
@@ -47,6 +46,8 @@ services:
         condition: service_started
     environment:
       - TARGET_URL=http://server:8080/hello
+    profiles:
+      - manual
 
 volumes:
   server-logs:

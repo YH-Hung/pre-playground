@@ -10,5 +10,5 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /client ./client
 
 FROM alpine:3.20
 COPY --from=builder /client /client
-CMD ["/client"]
+ENTRYPOINT ["/client"]
 
