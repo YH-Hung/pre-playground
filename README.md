@@ -1,11 +1,11 @@
-# Fluent Bit → Elasticsearch demo (Go server & client)
+# Vector → Elasticsearch demo (Go server & client)
 
-This example shows how to log per-request trace IDs, collect logs with Fluent Bit, and ship them to Elasticsearch 8 using Docker Compose.
+This example shows how to log per-request trace IDs, collect logs with Vector, and ship them to Elasticsearch 8 using Docker Compose.
 
 ## What's inside
 - Go HTTP server (`server/`) writing JSON logs with `traceId` to `/var/log/app/app.log` with graceful shutdown, health/metrics endpoints, and configurable settings.
 - Go client (`client/`) sending requests with a fresh `X-Trace-Id` header, featuring exponential backoff retry logic.
-- Fluent Bit tailing the server log with memory-safe Lua aggregation and forwarding to Elasticsearch + stdout with retry configuration.
+- Vector tailing the server log with native stateful aggregation and forwarding to Elasticsearch + stdout with retry configuration.
 - Elasticsearch 8 single node with security disabled for simplicity.
 
 ## Features
@@ -21,11 +21,13 @@ This example shows how to log per-request trace IDs, collect logs with Fluent Bi
 - **Configuration**: Environment variable support for all client parameters
 - **Error Handling**: Distinguishes between retryable and non-retryable errors
 
-### Fluent Bit
-- **Memory Leak Protection**: Lua script includes timestamp tracking, stale entry cleanup (30s timeout), and max buffer size limit (1000 entries) with LRU eviction
-- **Edge Case Handling**: Validates traceId, handles duplicate completion messages, and includes nil checks
+### Vector
+- **Robust Aggregation**: Native `reduce` transform provides built-in stateful aggregation by `traceId` with automatic memory management
+- **Memory Management**: Automatic stale entry cleanup (30s timeout) and max buffer size limit (1000 entries)
+- **Edge Case Handling**: Validates traceId, handles duplicate completion messages, and passes through entries without traceId
 - **Retry Configuration**: Elasticsearch output includes retry settings for resilience
-- **Fallback Output**: stdout output ensures logs are visible even if Elasticsearch fails
+- **Fallback Output**: Console output ensures logs are visible even if Elasticsearch fails
+- **Observability**: Built-in metrics and better debugging capabilities compared to Lua scripts
 
 ## Configuration
 
@@ -80,11 +82,11 @@ docker compose run --rm client \
 - `-interval 300ms` waits 300ms between requests per worker to avoid overwhelming the simple server while still generating multiple overlapping traces.
 - `-retries 3` sets maximum retry attempts for failed requests (default: 3).
 
-3) Watch Fluent Bit output (parsed logs):
+3) Watch Vector output (parsed logs):
 ```sh
-docker compose logs -f fluent-bit
+docker compose logs -f vector
 ```
-- `logs -f` tails the Fluent Bit container logs so you can see parsed JSON records and delivery status to Elasticsearch in real time.
+- `logs -f` tails the Vector container logs so you can see parsed JSON records and delivery status to Elasticsearch in real time.
 
 4) Query Elasticsearch for recent logs (get 5 newest):
 ```sh
@@ -92,7 +94,7 @@ curl -s "http://localhost:9200/requests-*/_search" \
   -H 'Content-Type: application/json' \
   -d '{"size":5,"sort":[{"@timestamp":{"order":"desc"}}]}'
 ```
-- `requests-*` matches the daily index name produced by Fluent Bit (`requests-%Y-%m-%d`).
+- `requests-*` matches the daily index name produced by Vector (`requests-%Y-%m-%d`).
 - `size:5` limits to 5 docs to keep the output readable.
 - `sort @timestamp desc` shows the most recent ingested entries first.
 
@@ -118,45 +120,47 @@ This implementation combines multiple log lines from the same request (same `tra
 ### Pipeline Flow
 
 ```
-Server Log File → Fluent Bit Tail Input → JSON Parser → Lua Aggregator → Elasticsearch
+Server Log File → Vector File Input → JSON Parser → Reduce Transform → Elasticsearch
 ```
 
 ### Step-by-Step Process
 
-1. **Input** (`[INPUT]` section in `fluent-bit.conf`):
-   - Fluent Bit tails `/var/log/app/app.log` line by line
-   - Each line is tagged as `app` and passed to the filter chain
+1. **File Input** (`sources.app_logs` in `vector.toml`):
+   - Vector tails `/var/log/app/app.log` line by line
+   - Each line is read and passed to the transform pipeline
 
-2. **JSON Parsing** (`[FILTER]` parser):
-   - Parses each log line as JSON
+2. **JSON Parsing** (`transforms.parse_json`):
+   - Parses each log line as JSON using Vector Remap Language (VRL)
    - Extracts fields like `traceId`, `message`, `method`, `path`, `status`, `latencyMs`
-   - The parsed record continues to the next filter
+   - Ensures `traceId` is a string (empty string if missing)
+   - The parsed record continues to the next transform
 
-3. **Lua Aggregation** (`[FILTER]` lua + `aggregate.lua`):
-   - **Buffering**: Maintains an in-memory buffer keyed by `traceId` with memory leak protection
+3. **Stream Splitting** (`transforms.split_streams`):
+   - Routes events into two streams:
+     - `has_traceid`: Events with valid traceId (non-empty string) → for aggregation
+     - `no_traceid`: Events without valid traceId → pass through directly
+
+4. **Stateful Aggregation** (`transforms.aggregate_by_traceid` using `reduce` transform):
+   - **Grouping**: Groups events by `traceId` field
    - **Memory Management**:
-     - Tracks `last_seen` timestamp for each buffer entry
-     - Periodically cleans up stale entries (older than 30 seconds)
-     - Enforces maximum buffer size (1000 entries) with LRU eviction
-     - Handles duplicate completion messages gracefully
-   - **For each incoming log entry**:
-     - Validates traceId format (non-empty string)
-     - If `traceId` exists in buffer: appends the `message` to the buffer entry's message array
-     - If new `traceId`: creates a new buffer entry (evicting oldest if at capacity)
-     - Updates other fields (method, path, status, latencyMs) with latest values
-     - Updates `last_seen` timestamp and LRU order
-   - **Suppression**: Returns `-1` to drop intermediate entries (they're buffered, not sent yet)
-   - **Flush trigger**: When a log entry contains `"request completed"`:
-     - Combines all buffered messages with `\n` separator: `message1\nmessage2\n...`
-     - Creates a single combined record with merged fields
-     - Returns `1` to pass the combined record to output
-     - Removes the entry from buffer and LRU tracking
+     - Automatically tracks and manages buffer state
+     - Cleans up stale entries after 30 seconds (`flush_period_secs`)
+     - Enforces maximum buffer size of 1000 entries (`max_events`)
+   - **Merge Strategies**:
+     - `message`: Concatenates all messages with `\n` separator (`concat_newline`)
+     - `method`, `path`, `status`, `latencyMs`: Keeps latest values (`merge`)
+   - **Conditional Flush**: When a log entry contains `"request completed"`:
+     - The `ends_when` condition triggers
+     - All buffered messages are combined with `\n` separator
+     - A single combined record with merged fields is emitted
+     - The buffer entry is automatically cleaned up
+   - **Pass-through**: Entries without valid traceId bypass aggregation and go directly to output
 
-4. **Output** (`[OUTPUT]` es):
-   - Only the combined records (one per `traceId`) are sent to Elasticsearch
+5. **Output** (`sinks.elasticsearch` and `sinks.console`):
+   - Combined records (one per `traceId`) and pass-through entries are sent to Elasticsearch
    - Each document contains all log lines from that request in a single `message` field
    - Includes retry configuration (5 retries with 1s wait) for resilience
-   - Falls back to stdout output if Elasticsearch is unavailable
+   - Console sink provides fallback output for debugging
 
 ### Example Transformation
 
@@ -180,26 +184,24 @@ Server Log File → Fluent Bit Tail Input → JSON Parser → Lua Aggregator →
 
 ### Key Implementation Details
 
-- **Buffer storage**: The Lua script uses a global `buffer` table to store entries by `traceId`
-- **Return codes**: 
-  - `-1`: Drop/suppress the record (intermediate entries)
-  - `1`: Pass the record through (combined entry or entries without traceId)
-- **Field merging**: Latest values for `status` and `latencyMs` are kept (from the "request completed" entry)
-- **Message combination**: All messages are joined with `\n` to create a multi-line text field
-- **Completion detection**: Uses `string.find()` to detect the "request completed" message pattern
+- **Stateful aggregation**: Vector's `reduce` transform maintains state automatically, grouping events by `traceId`
+- **Stream routing**: Events are split into aggregation and pass-through streams based on traceId validity
+- **Field merging**: Latest values for `method`, `path`, `status`, and `latencyMs` are kept using `merge` strategy
+- **Message combination**: All messages are joined with `\n` separator using `concat_newline` merge strategy
+- **Completion detection**: Uses VRL `contains!()` function to detect the "request completed" message pattern
+- **Memory management**: Built-in handling of stale entries (30s timeout) and max buffer size (1000 entries)
 
 ### Configuration Files
 
-- **`fluent-bit/fluent-bit.conf`**: Defines the filter pipeline with Lua filter
-- **`fluent-bit/aggregate.lua`**: Contains the aggregation logic
-- Both files are mounted into the Fluent Bit container via `docker-compose.yml`
+- **`vector/vector.toml`**: Defines the Vector pipeline with file source, JSON parsing, reduce transform, and Elasticsearch/console sinks
+- The configuration file is mounted into the Vector container via `docker-compose.yml`
 
 ## Architecture Diagram
 
 ```
 ┌─────────┐     ┌──────────┐     ┌─────────────┐     ┌──────────────┐
-│ Client  │────▶│  Server  │────▶│  Log File   │────▶│  Fluent Bit  │
-│ (retry) │     │(graceful)│     │  (buffered) │     │  (fixed Lua) │
+│ Client  │────▶│  Server  │────▶│  Log File   │────▶│    Vector    │
+│ (retry) │     │(graceful)│     │  (buffered) │     │  (reduce)    │
 └─────────┘     └──────────┘     └─────────────┘     └──────┬───────┘
                                                               │
                                                               ▼
@@ -216,20 +218,22 @@ Server Log File → Fluent Bit Tail Input → JSON Parser → Lua Aggregator →
 - Verify log directory permissions: `ls -la /var/log/app`
 - Check server logs: `docker compose logs server`
 
-### Fluent Bit not processing logs
+### Vector not processing logs
 - Verify log file exists: `docker compose exec server ls -la /var/log/app/app.log`
-- Check Fluent Bit logs: `docker compose logs fluent-bit`
-- Verify Lua script is mounted: `docker compose exec fluent-bit ls -la /fluent-bit/etc/aggregate.lua`
+- Check Vector logs: `docker compose logs vector`
+- Verify Vector config is mounted: `docker compose exec vector ls -la /etc/vector/vector.toml`
+- Check Vector configuration validity: `docker compose exec vector vector validate --config-dir /etc/vector`
 
 ### Elasticsearch connection issues
 - Check Elasticsearch health: `curl http://localhost:9200/_cluster/health`
-- Verify network connectivity: `docker compose exec fluent-bit ping elasticsearch`
-- Check Fluent Bit retry logs for connection failures
+- Verify network connectivity: `docker compose exec vector ping elasticsearch`
+- Check Vector retry logs for connection failures
 
-### Memory issues with Lua aggregation
-- The Lua script now includes automatic cleanup of stale entries (30s timeout)
-- Maximum buffer size is limited to 1000 entries with LRU eviction
-- Monitor Fluent Bit memory usage: `docker stats`
+### Memory issues with aggregation
+- Vector's reduce transform includes automatic cleanup of stale entries (30s timeout)
+- Maximum buffer size is limited to 1000 entries (`max_events` setting)
+- Monitor Vector memory usage: `docker stats`
+- Check Vector metrics: Vector exposes Prometheus metrics for monitoring aggregation state
 
 ### Client retry behavior
 - Network errors are automatically retried with exponential backoff
@@ -250,10 +254,11 @@ go test ./client/... -v
 ```
 
 ## Notes
-- Server log file is volume-mounted so Fluent Bit and Elasticsearch see the same data.
+- Server log file is volume-mounted so Vector and Elasticsearch see the same data.
 - Elasticsearch security is disabled here for brevity; enable auth in real deployments.
-- The Lua buffer is in-memory only; if Fluent Bit restarts, buffered entries may be lost (acceptable for this use case).
+- Vector's reduce transform buffer is in-memory by default; if Vector restarts, buffered entries may be lost (acceptable for this use case). Vector supports disk-backed state persistence for production use cases.
 - Server runs as non-root user for security (uid 1000).
 - Docker images are optimized with multi-stage builds and minimal base images.
 - Graceful shutdown ensures logs are flushed before server exits.
+- Vector provides better observability and maintainability compared to Lua scripts, with built-in metrics and easier configuration management.
 

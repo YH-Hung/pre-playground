@@ -1,0 +1,118 @@
+# Vector configuration for log aggregation by traceId
+# Replaces Fluent Bit + Lua script with native Vector reduce transform
+
+# File source: tail the server log file
+[sources.app_logs]
+type = "file"
+include = ["/var/log/app/app.log"]
+read_from = "end"  # Only read new lines, not from beginning (prevents duplicates on restart)
+max_line_bytes = 10485760  # 10MB (equivalent to Fluent Bit Mem_Buf_Limit)
+
+# Parse JSON from each log line
+# File source outputs the line content in .message field
+[transforms.parse_json]
+type = "remap"
+inputs = ["app_logs"]
+source = '''
+# Parse the log line as JSON and merge with existing fields
+# Use fallible parsing to handle malformed JSON gracefully
+parsed, err = parse_json(string!(.message))
+if err == null && parsed != null {
+  . = merge!(., parsed)
+  # Mark as successfully parsed
+  ._parsed = true
+} else {
+  # If JSON parsing fails, mark for dropping
+  ._parsed = false
+  .parse_error = "invalid_json"
+}
+# Ensure traceId is a string (empty string if missing)
+.traceId = string(.traceId) ?? ""
+'''
+
+# Filter out malformed JSON entries
+[transforms.filter_valid]
+type = "filter"
+inputs = ["parse_json"]
+condition = '._parsed == true'
+
+# Split into two streams: with traceId (for aggregation) and without (pass-through)
+[transforms.split_streams]
+type = "route"
+inputs = ["filter_valid"]
+route.has_traceid = 'exists(.traceId) && is_string(.traceId) && .traceId != ""'
+route.no_traceid = '!exists(.traceId) || !is_string(.traceId) || .traceId == ""'
+
+# Stateful aggregation by traceId using reduce transform
+[transforms.aggregate_by_traceid]
+type = "reduce"
+inputs = ["split_streams.has_traceid"]
+group_by = ["traceId"]
+
+# Flush when "request completed" message is detected
+ends_when = 'contains!(.message, "request completed")'
+
+# Merge strategies: concatenate messages, keep latest values for other fields
+[transforms.aggregate_by_traceid.merge_strategies]
+message = "concat_newline"
+method = "retain"
+path = "retain"
+status = "retain"
+latencyMs = "retain"
+
+# Clean up temporary fields before adding timestamp
+[transforms.cleanup_fields]
+type = "remap"
+inputs = ["aggregate_by_traceid", "split_streams.no_traceid"]
+source = '''
+# Remove temporary fields used for processing
+del(._parsed)
+'''
+
+# Add @timestamp and document ID for Elasticsearch (Logstash format)
+# Process both aggregated and pass-through streams
+[transforms.add_timestamp]
+type = "remap"
+inputs = ["cleanup_fields"]
+source = '''
+# Use current timestamp if not present
+if !exists(.@timestamp) {
+  .@timestamp = now()
+}
+# Create a unique document ID based on traceId to prevent duplicates
+# For aggregated entries (with traceId), use traceId as the document ID
+# Store in both document_id (for id_key) and _id (for Elasticsearch to recognize)
+# Entries without traceId will not have these set, so Elasticsearch will auto-generate one
+if exists(.traceId) && is_string(.traceId) && .traceId != "" {
+  .document_id = string!(.traceId)
+  ._id = string!(.traceId)
+}
+'''
+
+# Console output for debugging (equivalent to Fluent Bit stdout)
+[sinks.console]
+type = "console"
+inputs = ["add_timestamp"]
+encoding.codec = "json"
+
+# Elasticsearch output with retry configuration
+[sinks.elasticsearch]
+type = "elasticsearch"
+inputs = ["add_timestamp"]
+endpoints = ["http://elasticsearch:9200"]
+mode = "bulk"
+
+# Index configuration - use consistent date format
+[sinks.elasticsearch.bulk]
+index = "requests-%Y-%m-%d"
+id_key = "document_id"  # Use document_id as Elasticsearch _id to prevent duplicates
+
+# Retry configuration (matches Fluent Bit: 5 retries, 1s wait)
+[sinks.elasticsearch.request]
+retry_attempts = 5
+retry_initial_backoff_secs = 1
+retry_max_backoff_secs = 1
+retry_backoff_factor = 1
+
+# Elasticsearch settings
+compression = "none"

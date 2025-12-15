@@ -36,17 +36,15 @@ services:
       retries: 3
       start_period: 5s
 
-  fluent-bit:
-    image: fluent/fluent-bit:3.1
+  vector:
+    image: timberio/vector:0.38.0-alpine
     volumes:
-      - ./fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
-      - ./fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf:ro
-      - ./fluent-bit/aggregate.lua:/fluent-bit/etc/aggregate.lua:ro
+      - ./vector/vector.toml:/etc/vector/vector.toml:ro
       - server-logs:/var/log/app:ro
     depends_on:
       server:
         condition: service_started
-    command: ["-c", "/fluent-bit/etc/fluent-bit.conf"]
+    command: ["--config", "/etc/vector/vector.toml"]
 
   client:
     build:
