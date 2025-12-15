@@ -1,0 +1,38 @@
+# OS metadata
+.DS_Store
+
+# Editor settings
+.idea/
+.vscode/
+
+# Build outputs
+bin/
+build/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.o
+*.a
+
+# Dependencies
+vendor/
+
+# Logs and temp files
+*.log
+*.cache
+*.tmp
+tmp/
+
+# Coverage artifacts
+coverage.*
+*.coverprofile
+*.cov
+
+# Environment files
+.env
+.env.*
